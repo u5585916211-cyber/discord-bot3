@@ -27,7 +27,7 @@ CONFIG_PATH = DATA_DIR / "ai_config.json"
 MEMORY_PATH = DATA_DIR / "ai_memory.json"
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-HF_IMAGE_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+HF_IMAGE_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev"
 
 AI_LOG_CHANNEL_ID = 1489037001322790922
 AI_CHAT_CHANNEL_ID = 1489036537764122739
@@ -198,6 +198,12 @@ async def generate_image(prompt: str) -> bytes:
             if resp.status != 200:
                 error_text = await resp.text()
                 raise RuntimeError(f"HF Image Fehler {resp.status}: {error_text[:400]}")
+
+            content_type = resp.headers.get("content-type", "")
+            if not content_type.startswith("image/"):
+                error_text = await resp.text()
+                raise RuntimeError(f"HF Image Antwort war kein Bild: {error_text[:400]}")
+
             return await resp.read()
 
 
