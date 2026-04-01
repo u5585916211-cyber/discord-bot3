@@ -152,6 +152,33 @@ def split_message(text: str, limit: int = 1900):
 
 def build_embed(title: str, description: str, color: int) -> discord.Embed:
     embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_author(name="AI Assistant", icon_url="https://cdn.discordapp.com/embed/avatars/0.png")
+    return embed
+
+
+def build_log_embed(
+    guild: discord.Guild,
+    user: discord.abc.User,
+    prompt: str,
+    answer: str,
+    mode: str,
+    color: int,
+    source: str,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🧠 AI Ask Log",
+        description="Neue AI-Anfrage verarbeitet.",
+        color=color,
+    )
+    embed.add_field(name="👤 User", value=f"{user.mention}\n`{user.id}`", inline=True)
+    embed.add_field(name="🎭 Mode", value=f"`{mode}`", inline=True)
+    embed.add_field(name="📍 Source", value=f"`{source}`", inline=True)
+    embed.add_field(name="🏠 Server", value=guild.name, inline=False)
+    embed.add_field(name="💬 Prompt", value=prompt[:1024] or "-", inline=False)
+    embed.add_field(name="🤖 Antwort", value=answer[:1024] or "-", inline=False)
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_footer(text="AI Logs • /ask")
     return embed
 
 
@@ -308,7 +335,7 @@ async def ask(interaction: discord.Interaction, prompt: str):
     try:
         answer = await ask_ai(interaction.guild, interaction.user, prompt)
     except Exception as e:
-        await interaction.followup.send(f"AI Fehler: `{str(e)[:300]}`")
+        await interaction.followup.send(f"AI Fehler: `{str(e)[:300]}`", ephemeral=True)
         return
 
     color = conf.get("accent_color", 0x5865F2)
@@ -318,10 +345,26 @@ async def ask(interaction: discord.Interaction, prompt: str):
         if first:
             embed = build_embed(conf.get("title", "AI Assistant"), chunk, color)
             embed.set_footer(text=conf.get("footer", "Use /ask to talk"))
+            if interaction.guild.icon:
+                embed.set_thumbnail(url=interaction.guild.icon.url)
             await interaction.followup.send(embed=embed, ephemeral=True)
             first = False
         else:
             await interaction.followup.send(chunk, ephemeral=True)
+
+    log_channel = interaction.guild.get_channel(AI_LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(
+            embed=build_log_embed(
+                interaction.guild,
+                interaction.user,
+                prompt,
+                answer,
+                conf.get("mode", "normal"),
+                color,
+                "slash_ask",
+            )
+        )
 
 
 @bot.tree.command(name="image", description="Erstellt ein Bild mit AI.")
