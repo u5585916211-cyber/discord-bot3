@@ -2,30 +2,51 @@ import os
 import json
 import asyncio
 from pathlib import Path
-from datetime import datetime, timezone
+from collections import defaultdict
+from io import BytesIO
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 # =========================================================
-# Discord Verify Bot
-# Features:
-# - Clean verify UI with persistent buttons
-# - Admin slash commands
-# - /setup
-# - /verifypanel
-# - /pollmembers
-# - /pull
-# - /stats
-# - /restorecode
-# - JSON storage (Railway + GitHub friendly)
+# Free AI Discord Bot
+# - /ask for AI chat
+# - /mode to switch personalities
+# - /aichannel to enable auto AI replies in a channel
+# - /image to generate images (Hugging Face Inference)
+# - Auto reminder message: "Use /ask to talk"
+# - Clean embed UI
+# - GitHub + Railway friendly
 # =========================================================
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-CONFIG_FILE = DATA_DIR / "config.json"
-VERIFIED_FILE = DATA_DIR / "verified_users.json"
+CONFIG_PATH = DATA_DIR / "ai_config.json"
+MEMORY_PATH = DATA_DIR / "ai_memory.json"
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+HF_IMAGE_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+
+AI_LOG_CHANNEL_ID = 1489037001322790922
+AI_CHAT_CHANNEL_ID = 1489036537764122739
+
+AI_LOG_CHANNEL_ID = 1489037001322790922
+AI_CHAT_CHANNEL_ID = 1489036537764122739
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a stylish Discord AI assistant. Be helpful, clear, and fun. "
+    "Keep answers readable and not too long unless the user asks for detail."
+)
+
+MODES = {
+    "normal": "You are helpful, clean, friendly, and smart.",
+    "funny": "You are funny, playful, and entertaining without being rude.",
+    "gamer": "You are energetic, gamer-style, casual, and hype.",
+    "anime": "You are dramatic, friendly, anime-inspired, and expressive.",
+    "coder": "You are a strong programming helper who explains clearly and writes usable code.",
+}
 
 
 def load_json(path: Path, default):
@@ -44,45 +65,46 @@ def save_json(path: Path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-config = load_json(CONFIG_FILE, {})
-verified_users = load_json(VERIFIED_FILE, {})
+config = load_json(CONFIG_PATH, {})
+memory_store = load_json(MEMORY_PATH, {})
 
 
-# =========================
+intents = discord.Intents.default()
+intents.guilds = True
+intents.messages = True
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+cooldowns = defaultdict(float)
+reminder_cooldowns = defaultdict(float)
+
+
+# =========================================================
 # Helpers
-# =========================
+# =========================================================
 def guild_key(guild_id: int) -> str:
     return str(guild_id)
 
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-
 def ensure_guild(guild_id: int):
-    key = guild_key(guild_id)
-    if key not in config:
-        config[key] = {
-            "verify_channel_id": None,
-            "verify_role_id": None,
-            "unverified_role_id": None,
-            "log_channel_id": None,
-            "panel_message_id": None,
-            "panel_created_at": None,
-            "accent_color": 0x57F287,
-            "title": "Server Verify",
-            "description": "Klicke auf **Verify**, um Zugriff auf den Server zu erhalten.",
-            "footer": "Secure Verification System",
-            "thumbnail_url": None,
-            "image_url": None,
+    gid = guild_key(guild_id)
+    if gid"ai_channels": [AI_CHAT_CHANNEL_ID],      config[gid] = {
+            "mode": "normal",
+            "ai_channels": [AI_CHAT_CHANNEL_ID],
+            "accent_color": 0x5865F2,
+            "title": "AI Assistant",
+            "footer": "Use /ask to talk",
+            "image_enabled": True,
+            "show_reminder_message": True,
         }
-        save_json(CONFIG_FILE, config)
+        save_json(CONFIG_PATH, config)
 
-    if key not in verified_users:
-        verified_users[key] = []
-        save_json(VERIFIED_FILE, verified_users)
+    if gid not in memory_store:
+        memory_store[gid] = {}
+        save_json(MEMORY_PATH, memory_store)
 
 
 
@@ -92,490 +114,355 @@ def get_conf(guild_id: int) -> dict:
 
 
 
-def get_verified_ids(guild_id: int) -> list[int]:
+def get_user_memory(guild_id: int, user_id: int) -> list:
     ensure_guild(guild_id)
-    return verified_users[guild_key(guild_id)]
+    gid = guild_key(guild_id)
+    uid = str(user_id)
+    if uid not in memory_store[gid]:
+        memory_store[gid][uid] = []
+        save_json(MEMORY_PATH, memory_store)
+    return memory_store[gid][uid]
 
 
 
-def add_verified_user(guild_id: int, user_id: int):
-    users = get_verified_ids(guild_id)
-    if user_id not in users:
-        users.append(user_id)
-        save_json(VERIFIED_FILE, verified_users)
+def push_memory(guild_id: int, user_id: int, role: str, content: str, max_items: int = 10):
+    mem = get_user_memory(guild_id, user_id)
+    mem.append({"role": role, "content": content[:2000]})
+    memory_store[guild_key(guild_id)][str(user_id)] = mem[-max_items:]
+    save_json(MEMORY_PATH, memory_store)
 
 
 
-def build_verify_embed(guild: discord.Guild) -> discord.Embed:
-    conf = get_conf(guild.id)
-    color = conf.get("accent_color", 0x57F287)
+def is_admin(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
 
-    embed = discord.Embed(
-        title=conf.get("title", "Server Verify"),
-        description=conf.get("description", "Klicke auf Verify, um Zugriff zu bekommen."),
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
 
-    verify_role_id = conf.get("verify_role_id")
-    if verify_role_id:
-        embed.add_field(
-            name="Zugang",
-            value=f"Nach der Verifizierung erhältst du <@&{verify_role_id}>.",
-            inline=False,
-        )
 
-    embed.add_field(
-        name="Hinweis",
-        value="Wenn der Button nicht geht, kontaktiere das Team.",
-        inline=False,
-    )
+def split_message(text: str, limit: int = 1900):
+    parts = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        parts.append(text[:split_at])
+        text = text[split_at:].lstrip()
+    if text:
+        parts.append(text)
+    return parts
 
-    embed.set_footer(text=conf.get("footer", "Secure Verification System"))
 
-    thumb = conf.get("thumbnail_url")
-    image = conf.get("image_url")
-    if thumb:
-        embed.set_thumbnail(url=thumb)
-    if image:
-        embed.set_image(url=image)
 
+def build_embed(title: str, description: str, color: int) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=color)
     return embed
 
 
+async def call_openrouter(messages: list[dict]) -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY fehlt.")
 
-def build_stats_embed(guild: discord.Guild) -> discord.Embed:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("APP_URL", "https://railway.app"),
+        "X-Title": os.getenv("APP_NAME", "Discord AI Bot"),
+    }
+
+    payload = {
+        "model": os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+        "messages": messages,
+        "temperature": 0.9,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(OPENROUTER_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise RuntimeError(f"OpenRouter Fehler {resp.status}: {error_text[:400]}")
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+
+
+async def generate_image(prompt: str) -> bytes:
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise RuntimeError("HF_TOKEN fehlt.")
+
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"inputs": prompt}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(HF_IMAGE_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise RuntimeError(f"HF Image Fehler {resp.status}: {error_text[:400]}")
+            return await resp.read()
+
+
+async def ask_ai(guild: discord.Guild, user: discord.abc.User, prompt: str) -> str:
     conf = get_conf(guild.id)
-    verified_ids = set(get_verified_ids(guild.id))
+    mode = conf.get("mode", "normal")
+    mode_prompt = MODES.get(mode, MODES["normal"])
+    user_memory = get_user_memory(guild.id, user.id)
 
-    total_members = guild.member_count or 0
-    bots = sum(1 for m in guild.members if m.bot)
-    humans = total_members - bots
+    messages = [
+        {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+        {"role": "system", "content": f"Current mode: {mode}. {mode_prompt}"},
+    ]
+    messages.extend(user_memory)
+    messages.append({"role": "user", "content": prompt})
 
-    verify_role = guild.get_role(conf.get("verify_role_id")) if conf.get("verify_role_id") else None
-    verified_count = len([m for m in guild.members if not m.bot and m.id in verified_ids])
-    unverified_count = max(humans - verified_count, 0)
-
-    embed = discord.Embed(
-        title="Member Overview",
-        description="Aktuelle Server- und Verify-Statistiken",
-        color=conf.get("accent_color", 0x5865F2),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Gesamtmitglieder", value=str(total_members), inline=True)
-    embed.add_field(name="Menschen", value=str(humans), inline=True)
-    embed.add_field(name="Bots", value=str(bots), inline=True)
-    embed.add_field(name="Verifiziert", value=str(verified_count), inline=True)
-    embed.add_field(name="Unverifiziert", value=str(unverified_count), inline=True)
-    embed.add_field(name="Verify-Rolle", value=verify_role.mention if verify_role else "Nicht gesetzt", inline=True)
-    embed.set_footer(text=f"Server: {guild.name}")
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    return embed
+    answer = await call_openrouter(messages)
+    push_memory(guild.id, user.id, "user", prompt)
+    push_memory(guild.id, user.id, "assistant", answer)
+    return answer
 
 
-# =========================
-# Discord bot setup
-# =========================
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-# =========================
-# Persistent UI Views
-# =========================
-class VerifyView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Verify", emoji="✅", style=discord.ButtonStyle.success, custom_id="verify:confirm")
-    async def verify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.guild is None:
-            await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
-            return
-
-        conf = get_conf(interaction.guild.id)
-        verify_role_id = conf.get("verify_role_id")
-        unverified_role_id = conf.get("unverified_role_id")
-
-        if not verify_role_id:
-            await interaction.response.send_message("Es ist noch keine Verify-Rolle gesetzt.", ephemeral=True)
-            return
-
-        member = interaction.user
-        if not isinstance(member, discord.Member):
-            await interaction.response.send_message("Mitglied konnte nicht erkannt werden.", ephemeral=True)
-            return
-
-        verify_role = interaction.guild.get_role(verify_role_id)
-        if verify_role is None:
-            await interaction.response.send_message("Die Verify-Rolle wurde nicht gefunden.", ephemeral=True)
-            return
-
-        if verify_role in member.roles:
-            await interaction.response.send_message("Du bist bereits verifiziert.", ephemeral=True)
-            return
-
-        roles_to_add = [verify_role]
-        roles_to_remove = []
-
-        if unverified_role_id:
-            unverified_role = interaction.guild.get_role(unverified_role_id)
-            if unverified_role and unverified_role in member.roles:
-                roles_to_remove.append(unverified_role)
-
-        try:
-            await member.add_roles(*roles_to_add, reason="User verified via button")
-            if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason="User verified")
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "Ich habe keine Rechte, die Rolle zu vergeben. Prüfe Rollenposition und Berechtigungen.",
-                ephemeral=True,
-            )
-            return
-        except discord.HTTPException:
-            await interaction.response.send_message("Die Rolle konnte gerade nicht vergeben werden.", ephemeral=True)
-            return
-
-        add_verified_user(interaction.guild.id, member.id)
-
-        await interaction.response.send_message(
-            f"✅ Du bist jetzt verifiziert und hast {verify_role.mention} erhalten.",
-            ephemeral=True,
-        )
-
-        log_channel_id = conf.get("log_channel_id")
-        if log_channel_id:
-            log_channel = interaction.guild.get_channel(log_channel_id)
-            if log_channel:
-                embed = discord.Embed(
-                    title="Verify Log",
-                    description=f"{member.mention} wurde erfolgreich verifiziert.",
-                    color=0x57F287,
-                    timestamp=datetime.now(timezone.utc),
-                )
-                embed.add_field(name="User ID", value=str(member.id), inline=True)
-                embed.add_field(name="Account erstellt", value=discord.utils.format_dt(member.created_at, style="R"), inline=True)
-                await log_channel.send(embed=embed)
-
-    @discord.ui.button(label="Info", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="verify:info")
-    async def info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.guild is None:
-            await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
-            return
-
-        conf = get_conf(interaction.guild.id)
-        verify_role_id = conf.get("verify_role_id")
-        verify_role_text = f"<@&{verify_role_id}>" if verify_role_id else "Nicht gesetzt"
-
-        embed = discord.Embed(
-            title="Verify Informationen",
-            description="Hier findest du Infos zum Verifizierungssystem.",
-            color=conf.get("accent_color", 0x5865F2),
-        )
-        embed.add_field(name="Verify-Rolle", value=verify_role_text, inline=False)
-        embed.add_field(name="Ablauf", value="Drücke auf **Verify**, um Zugriff zu erhalten.", inline=False)
-        embed.add_field(name="Probleme?", value="Melde dich beim Team, falls etwas nicht funktioniert.", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(label="Member Stats", emoji="📊", style=discord.ButtonStyle.primary, custom_id="verify:stats")
-    async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.guild is None:
-            await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
-            return
-        await interaction.response.send_message(embed=build_stats_embed(interaction.guild), ephemeral=True)
-
-
-# =========================
+# =========================================================
 # Events
-# =========================
+# =========================================================
 @bot.event
 async def on_ready():
-    bot.add_view(VerifyView())
     try:
         synced = await bot.tree.sync()
-        print(f"Bot online als {bot.user} | Commands synced: {len(synced)}")
-    except Exception as e:
-        print(f"Command sync error: {e}")
-
-
-# =========================
-# Checks
-# =========================
-def is_admin(interaction: discord.Interaction) -> bool:
-    return bool(interaction.user.guild_permissions.administrator) if isinstance(interaction.user, discord.Member) else False
-
-
-# =========================
-# Slash commands
-# =========================
-@bot.tree.command(name="setup", description="Setup für Verify-System.")
-@app_commands.describe(
-    verify_channel="Channel für das Verify-Panel",
-    verify_role="Rolle, die nach Verify vergeben wird",
-    log_channel="Optionaler Log-Channel",
-    unverified_role="Optionale Rolle, die nach Verify entfernt wird",
-)
-async def setup(
-    interaction: discord.Interaction,
-    verify_channel: discord.TextChannel,
-    verify_role: discord.Role,
-    log_channel: discord.TextChannel | None = None,
-    unverified_role: discord.Role | None = None,
-):
-    if interaction.guild is None:
-        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
-        return
-    if not is_admin(interaction):
-        await interaction.response.send_message("Nur Admins können diesen Command benutzen.", ephemeral=True)
+        print(f"Bot online als {bot.user} | Slash Commands synced: {len(synced)}")
+        await bot.change_presence(activity=discord.Cust@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.guild is None:
         return
 
-    conf = get_conf(interaction.guild.id)
-    conf["verify_channel_id"] = verify_channel.id
-    conf["verify_role_id"] = verify_role.id
-    conf["log_channel_id"] = log_channel.id if log_channel else None
-    conf["unverified_role_id"] = unverified_role.id if unverified_role else None
-    save_json(CONFIG_FILE, config)
+    conf = get_conf(message.guild.id)
+    ai_channels = conf.get("ai_channels", [])
 
-    embed = discord.Embed(title="Setup gespeichert", color=0x57F287)
-    embed.add_field(name="Verify-Channel", value=verify_channel.mention, inline=False)
-    embed.add_field(name="Verify-Rolle", value=verify_role.mention, inline=False)
-    embed.add_field(name="Log-Channel", value=log_channel.mention if log_channel else "Nicht gesetzt", inline=False)
-    embed.add_field(name="Unverified-Rolle", value=unverified_role.mention if unverified_role else "Nicht gesetzt", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if message.channel.id in ai_channels:
+        now = asyncio.get_event_loop().time()
+        key = f"chat:{message.guild.id}:{message.author.id}"
+        if now - cooldowns[key] < 5:
+            return
+        cooldowns[key] = now
 
+        async with message.channel.typing():
+            try:
+                answer = await ask_ai(message.guild, message.author, message.content)
+            except Exception as e:
+                await message.reply(f"AI Fehler: `{str(e)[:300]}`")
+                return
 
-@bot.tree.command(name="verifypanel", description="Sendet das Verify-UI in den gesetzten Verify-Channel.")
-async def verifypanel(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
-        return
-    if not is_admin(interaction):
-        await interaction.response.send_message("Nur Admins können diesen Command benutzen.", ephemeral=True)
-        return
+        color = conf.get("accent_color", 0x5865F2)
+        chunks = split_message(answer)
+        first = True
+        for chunk in chunks:
+            if first:
+                embed = build_embed(conf.get("title", "AI Assistant"), chunk, color)
+                embed.set_footer(text=conf.get("footer", "Use /ask to talk"))
+                await message.reply(embed=embed, mention_author=False)
+                first = False
+            else:
+                await message.channel.send(chunk)
 
-    conf = get_conf(interaction.guild.id)
-    verify_channel_id = conf.get("verify_channel_id")
-    verify_role_id = conf.get("verify_role_id")
+        log_channel = message.guild.get_channel(AI_LOG_CHANNEL_ID)
+        if log_channel:
+            log_embed = discord.Embed(title="AI Log", color=color)
+            log_embed.add_field(name="User", value=f"{message.author} ({message.author.id})", inline=False)
+            log_embed.add_field(name="Channel", value=message.channel.mention, inline=False)
+            log_embed.add_field(name="Prompt", value=message.content[:1024], inline=False)
+            log_embed.add_field(name="Mode", value=conf.get("mode", "normal"), inline=True)
+            await log_channel.send(embed=log_embed)
+    else:
+        if conf.get("show_reminder_message", True) and not message.content.startswith("/"):
+            now = asyncio.get_event_loop().time()
+            key = f"reminder:{message.guild.id}:{message.channel.id}"
+            if now - reminder_cooldowns[key] > 120:
+                reminder_cooldowns[key] = now
+                await message.channel.send("💡 Use `/ask` to talk to the AI.")
 
-    if not verify_channel_id or not verify_role_id:
-        await interaction.response.send_message("Nutze zuerst /setup.", ephemeral=True)
-        return
-
-    channel = interaction.guild.get_channel(verify_channel_id)
-    if channel is None:
-        await interaction.response.send_message("Verify-Channel nicht gefunden.", ephemeral=True)
-        return
-
-    embed = build_verify_embed(interaction.guild)
-    message = await channel.send(embed=embed, view=VerifyView())
-
-    conf["panel_message_id"] = message.id
-    conf["panel_created_at"] = utc_now_iso()
-    save_json(CONFIG_FILE, config)
-
-    await interaction.response.send_message(f"✅ Verify-Panel wurde in {channel.mention} gesendet.", ephemeral=True)
-
-
-@bot.tree.command(name="pollmembers", description="Zeigt Member- und Verify-Statistiken vom Server.")
-async def pollmembers(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
-        return
-    if not is_admin(interaction):
-        await interaction.response.send_message("Nur Admins können diesen Command benutzen.", ephemeral=True)
-        return
-
-    await interaction.response.send_message(embed=build_stats_embed(interaction.guild), ephemeral=False)
+    await bot.process_commands(message)
 
 
-@bot.tree.command(name="pull", description="Gibt gespeicherten verifizierten Usern ihre Rolle zurück, falls sie fehlt.")
-async def pull(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
-        return
-    if not is_admin(interaction):
-        await interaction.response.send_message("Nur Admins können diesen Command benutzen.", ephemeral=True)
-        return
+# =========================================================
+# Slash Commandsd_field(name="Channel", value=message.channel.mention, inline=False)
+            log_embed.add_field(name="Prompt", value=message.content[:1024], inline=False)
+            log_embed.add_field(name="Mode", value=conf.get("mode", "normal"), inline=True)
+            await log_channel.send(embed=log_embed)
+    else:
+        if conf.get("show_reminder_message", True) and not message.content.startswitawait interaction.response.defer(ephemeral=True)get_event_loop().time()
+            key = f"reminder:{message.guild.id}:{message.channel.id}"
+            if now - reminder_cooldowns[key] > 120:
+                reminder_cooldowns[key] = now
+                await message.channel.send("💡 Use `/ask` to talk to the AI.")
 
-    conf = get_conf(interaction.guild.id)
-    verify_role_id = conf.get("verify_role_id")
-    if not verify_role_id:
-        await interaction.response.send_message("Nutze zuerst /setup.", ephemeral=True)
-        return
+    await bot.process_commands(message)
 
-    verify_role = interaction.guild.get_role(verify_role_id)
-    if verify_role is None:
-        await interaction.response.send_message("Verify-Rolle nicht gefunden.", ephemeral=True)
+
+# =========================================================
+# Slash Commands
+# =========================================================
+@bot.tree.command(name="ask", description="Sprich mit der AI.")
+@app_commands.describe(prompt="Deine await interaction.followup.send(embed=embed, ephemeral=True)ion: discord.Interaction, prompt: str):
+    if interaawait interaction.followup.send(chunk, ephemeral=True)eraction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
+    conf = get_conf(interaction.guild.id)
 
-    restored = 0
-    already_had = 0
-    not_found = 0
-    failed = 0
+    try:
+        answer = await ask_ai(interaction.guild, interaction.user, prompt)
+    except Exception as e:
+        await interaction.followup.send(f"AI Fehler: `{str(e)[:300]}`")
+        return
 
-    for user_id in get_verified_ids(interaction.guild.id):
-        member = interaction.guild.get_member(user_id)
-        if member is None:
-            not_found += 1
-            continue
-        if verify_role in member.roles:
-            already_had += 1
-            continue
-        try:
-            await member.add_roles(verify_role, reason="Restore via /pull")
-            restored += 1
-            await asyncio.sleep(0.35)
-        except Exception:
-            failed += 1
-
-    embed = discord.Embed(
-        title="Pull abgeschlossen",
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Wiederhergestellt", value=str(restored), inline=True)
-    embed.add_field(name="Schon vorhanden", value=str(already_had), inline=True)
-    embed.add_field(name="Nicht gefunden", value=str(not_found), inline=True)
-    embed.add_field(name="Fehlgeschlagen", value=str(failed), inline=True)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    color = conf.get("accent_color", 0x5865F2)
+    chunks = split_message(answer)
+    first = True
+    for chunk in chunks:
+        if first:
+            embed = build_embed(conf.get("title", "AI Assistant"), chunk, color)
+            embed.set_footer(text=conf.get("footer", "Use /ask to talk"))
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            first = False
+        else:
+            await interaction.followup.send(chunk, ephemeral=True)
 
 
-@bot.tree.command(name="stats", description="Zeigt die Verify-Konfiguration und Systeminfos.")
-async def stats(interaction: discord.Interaction):
+@bot.tree.command(name="image", description="Erstellt ein Bild mit AI.")
+@app_commands.describe(prompt="Bildbeschreibung")
+async def image(interaction: discord.Interaction, prompt: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
+        return
+
+    conf = get_conf(interaction.guild.id)
+    if not conf.get("image_enabled", True):
+        await interaction.response.send_message("Image Generation ist deaktiviert.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        image_bytes = await generate_image(prompt)
+    except Exception as e:
+        await interaction.followup.send(f"Image Fehler: `{str(e)[:300]}`")
+        return
+
+    file = discord.File(fp=BytesIO(image_bytes), filename="ai_image.png")
+    embed = discord.Embed(title="AI Image", description=f"**Prompt:** {prompt}", color=conf.get("accent_color", 0x5865F2))
+    embed.set_image(url="attachment://ai_image.png")
+    embed.set_footer(text=conf.get("footer", "Use /ask to talk"))
+    await interaction.followup.send(embed=embed, file=file)
+
+
+@bot.tree.command(name="mode", description="Wechselt den AI Modus.")
+@app_commands.describe(mode="normal, funny, gamer, anime, coder")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="normal", value="normal"),
+    app_commands.Choice(name="funny", value="funny"),
+    app_commands.Choice(name="gamer", value="gamer"),
+    app_commands.Choice(name="anime", value="anime"),
+    app_commands.Choice(name="coder", value="coder"),
+])
+async def mode(interaction: discord.Interaction, mode: app_commands.Choice[str]):
     if interaction.guild is None:
         await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
         return
     if not is_admin(interaction):
-        await interaction.response.send_message("Nur Admins können diesen Command benutzen.", ephemeral=True)
+        await interaction.response.send_message("Nur Admins können den Modus ändern.", ephemeral=True)
         return
 
     conf = get_conf(interaction.guild.id)
+    conf["mode"] = mode.value
+    save_json(CONFIG_PATH, config)
 
-    embed = discord.Embed(
-        title="Verify System Stats",
-        color=conf.get("accent_color", 0x5865F2),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(
-        name="Verify-Channel",
-        value=f"<#{conf['verify_channel_id']}>" if conf.get("verify_channel_id") else "Nicht gesetzt",
-        inline=False,
-    )
-    embed.add_field(
-        name="Verify-Rolle",
-        value=f"<@&{conf['verify_role_id']}>" if conf.get("verify_role_id") else "Nicht gesetzt",
-        inline=False,
-    )
-    embed.add_field(
-        name="Unverified-Rolle",
-        value=f"<@&{conf['unverified_role_id']}>" if conf.get("unverified_role_id") else "Nicht gesetzt",
-        inline=False,
-    )
-    embed.add_field(
-        name="Log-Channel",
-        value=f"<#{conf['log_channel_id']}>" if conf.get("log_channel_id") else "Nicht gesetzt",
-        inline=False,
-    )
-    embed.add_field(
-        name="Panel Message ID",
-        value=str(conf.get("panel_message_id") or "Nicht gesetzt"),
-        inline=False,
-    )
-    embed.add_field(
-        name="Gespeicherte Verifizierte",
-        value=str(len(get_verified_ids(interaction.guild.id))),
-        inline=False,
-    )
-    embed.add_field(
-        name="Panel erstellt",
-        value=conf.get("panel_created_at") or "Noch nicht erstellt",
-        inline=False,
-    )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed = discord.Embed(title="Mode geändert", description=f"Neuer Modus: **{mode.value}**", color=conf.get("accent_color", 0x5865F2))
+    await interaction.res
 
 
-@bot.tree.command(name="restorecode", description="Erstellt einen Restore-Code für die aktuelle Verify-Konfiguration.")
-async def restorecode(interaction: discord.Interaction):
+@bot.tree.command(name="aichannel", description="Aktiviert oder deaktiviert AI Auto-Chat in einem Channel.")
+@app_commands.describe(channel="Der Channel", enabled="true oder false")
+async def aichannel(interaction: discord.Interaction, channel: discord.TextChannel, enabled: bool):
     if interaction.guild is None:
         await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
         return
     if not is_admin(interaction):
-        await interaction.response.send_message("Nur Admins können diesen Command benutzen.", ephemeral=True)
+        await interaction.response.send_message("Nur Admins können das ändern.", ephemeral=True)
         return
 
     conf = get_conf(interaction.guild.id)
-    payload = {
-        "guild_id": interaction.guild.id,
-        "verify_channel_id": conf.get("verify_channel_id"),
-        "verify_role_id": conf.get("verify_role_id"),
-        "unverified_role_id": conf.get("unverified_role_id"),
-        "log_channel_id": conf.get("log_channel_id"),
-        "panel_message_id": conf.get("panel_message_id"),
-        "verified_users": len(get_verified_ids(interaction.guild.id)),
-        "generated_at": utc_now_iso(),
-    }
+    ai_channels = conf.get("ai_channels", [])
 
-    code = json.dumps(payload, separators=(",", ":"))
-    await interaction.response.send_message(f"```json\n{code}\n```", ephemeral=True)
+    if enabled and channel.id not in ai_channels:
+        ai_channels.append(channel.id)
+    elif not enabled and channel.id in ai_channels:
+        ai_channels.remove(channel.id)
+
+    conf["ai_channels"] = ai_channels
+    save_json(CONFIG_PATH, config)
+
+    state = "aktiviert" if enabled else "deaktiviert"
+    await interaction.response.send_message(f"AI Auto-Chat wurde für {channel.mention} **{state}**.", ephemeral=True)
 
 
-@bot.tree.command(name="setbranding", description="Passt Titel, Text und Design vom Verify-Panel an.")
-@app_commands.describe(
-    title="Titel vom Verify-Embed",
-    description="Beschreibung vom Verify-Embed",
-    footer="Footer Text",
-    hex_color="Hex Farbe, z. B. 57F287",
-    thumbnail_url="Thumbnail URL",
-    image_url="Großes Bild URL",
-)
-async def setbranding(
-    interaction: discord.Interaction,
-    title: str,
-    description: str,
-    footer: str,
-    hex_color: str | None = None,
-    thumbnail_url: str | None = None,
-    image_url: str | None = None,
-):
+@bot.tree.command(name="setaiui", description="Ändert Titel, Farbe und Footer vom AI Bot UI.")
+@app_commands.describe(title="Titel", footer="Footer", hex_color="z.B. 5865F2")
+async def setaiui(interaction: discord.Interaction, title: str, footer: str, hex_color: str):
     if interaction.guild is None:
         await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
         return
     if not is_admin(interaction):
-        await interaction.response.send_message("Nur Admins können diesen Command benutzen.", ephemeral=True)
+        await interaction.response.send_message("Nur Admins können das ändern.", ephemeral=True)
         return
 
     conf = get_conf(interaction.guild.id)
+    try:
+        conf["accent_color"] = int(hex_color.replace("#", ""), 16)
+    except ValueError:
+        await interaction.response.send_message("Ungültige Farbe. Beispiel: 5865F2", ephemeral=True)
+        return
+
     conf["title"] = title
-    conf["description"] = description
     conf["footer"] = footer
-    conf["thumbnail_url"] = thumbnail_url
-    conf["image_url"] = image_url
-
-    if hex_color:
-        try:
-            conf["accent_color"] = int(hex_color.replace("#", ""), 16)
-        except ValueError:
-            await interaction.response.send_message("Ungültige Hex-Farbe. Beispiel: 57F287", ephemeral=True)
-            return
-
-    save_json(CONFIG_FILE, config)
-
-    await interaction.response.send_message("✅ Branding wurde gespeichert.", ephemeral=True)
+    save_json(CONFIG_PATH, config)
+    await interaction.response.send_message("AI UI wurde gespeichert.", ephemeral=True)
 
 
-# =========================
-# Run bot
-# =========================
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN fehlt. Setze ihn als Environment Variable in Railway.")
+@bot.tree.command(name="prompthelp", description="Zeigt die AI Befehle an.")
+async def prompthelp(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
+        return
 
-bot.run(TOKEN)
+    conf = get_conf(interaction.guild.id)
+    embed = discord.Embed(title="AI Commands", color=conf.get("accent_color", 0x5865F2))
+    embed.add_field(name="/ask", value="Sprich mit der AI", inline=False)
+    embed.add_field(name="/image", value="Erstelle ein AI Bild", inline=False)
+    embed.add_field(name="/mode", value="Ändere den AI Stil", inline=False)
+    embed.add_field(name="/aichannel", value="Auto AI Replies für einen Channel", inline=False)
+    embed.add_field(name="/setaiui", value="Passe das Bot UI an", inline=False)
+    embed.set_footer(text=conf.get("footer", "Use /ask to talk"))
+    await interaction.response.send_message(embed=eiption="Löscht den gespeicherten Verlauf eines Users.")
+@app_commands.describe(user="Optional ein bestimmter User")
+async def clearhistory(interaction: discord.Interaction, user: discord.Member | None = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
+        return
+    if not is_admin(interaction):
+        await interaction.response.send_message("Nur Admins können das benutzen.", ephemeral=True)
+        return
+
+    target = user or interaction.user
+    ensure_guild(interaction.guild.id)
+    memory_store[guild_key(interaction.guild.id)][str(target.id)] = []
+    save_json(MEMORY_PATH, memory_store)
+    await interaction.response.send_message(f"History von {target.mention} wurde gelöscht.", ephemeral=True)
+
+
+# =========================================================
+# ENV + RUN
+# =========================================================
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN fehlt. Setze ihn in Railway.")
+
+bot.run(DISCORD_TOKEN)
