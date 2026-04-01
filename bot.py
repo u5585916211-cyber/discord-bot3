@@ -32,9 +32,6 @@ HF_IMAGE_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-d
 AI_LOG_CHANNEL_ID = 1489037001322790922
 AI_CHAT_CHANNEL_ID = 1489036537764122739
 
-AI_LOG_CHANNEL_ID = 1489037001322790922
-AI_CHAT_CHANNEL_ID = 1489036537764122739
-
 DEFAULT_SYSTEM_PROMPT = (
     "You are a stylish Discord AI assistant. Be helpful, clear, and fun. "
     "Keep answers readable and not too long unless the user asks for detail."
@@ -91,7 +88,8 @@ def guild_key(guild_id: int) -> str:
 
 def ensure_guild(guild_id: int):
     gid = guild_key(guild_id)
-    if gid"ai_channels": [AI_CHAT_CHANNEL_ID],      config[gid] = {
+    if gid not in config:
+        config[gid] = {
             "mode": "normal",
             "ai_channels": [AI_CHAT_CHANNEL_ID],
             "accent_color": 0x5865F2,
@@ -230,7 +228,12 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"Bot online als {bot.user} | Slash Commands synced: {len(synced)}")
-        await bot.change_presence(activity=discord.Cust@bot.event
+        await bot.change_presence(activity=discord.CustomActivity(name="Use /ask to talk"))
+    except Exception as e:
+        print(f"Sync error: {e}")
+
+
+@bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.guild is None:
         return
@@ -284,26 +287,13 @@ async def on_message(message: discord.Message):
 
 
 # =========================================================
-# Slash Commandsd_field(name="Channel", value=message.channel.mention, inline=False)
-            log_embed.add_field(name="Prompt", value=message.content[:1024], inline=False)
-            log_embed.add_field(name="Mode", value=conf.get("mode", "normal"), inline=True)
-            await log_channel.send(embed=log_embed)
-    else:
-        if conf.get("show_reminder_message", True) and not message.content.startswitawait interaction.response.defer(ephemeral=True)get_event_loop().time()
-            key = f"reminder:{message.guild.id}:{message.channel.id}"
-            if now - reminder_cooldowns[key] > 120:
-                reminder_cooldowns[key] = now
-                await message.channel.send("💡 Use `/ask` to talk to the AI.")
-
-    await bot.process_commands(message)
-
-
-# =========================================================
 # Slash Commands
 # =========================================================
 @bot.tree.command(name="ask", description="Sprich mit der AI.")
-@app_commands.describe(prompt="Deine await interaction.followup.send(embed=embed, ephemeral=True)ion: discord.Interaction, prompt: str):
-    if interaawait interaction.followup.send(chunk, ephemeral=True)eraction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
+@app_commands.describe(prompt="Deine Nachricht an die AI")
+async def ask(interaction: discord.Interaction, prompt: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Das geht nur auf einem Server.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -376,7 +366,7 @@ async def mode(interaction: discord.Interaction, mode: app_commands.Choice[str])
     save_json(CONFIG_PATH, config)
 
     embed = discord.Embed(title="Mode geändert", description=f"Neuer Modus: **{mode.value}**", color=conf.get("accent_color", 0x5865F2))
-    await interaction.res
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="aichannel", description="Aktiviert oder deaktiviert AI Auto-Chat in einem Channel.")
@@ -441,7 +431,10 @@ async def prompthelp(interaction: discord.Interaction):
     embed.add_field(name="/aichannel", value="Auto AI Replies für einen Channel", inline=False)
     embed.add_field(name="/setaiui", value="Passe das Bot UI an", inline=False)
     embed.set_footer(text=conf.get("footer", "Use /ask to talk"))
-    await interaction.response.send_message(embed=eiption="Löscht den gespeicherten Verlauf eines Users.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="clearhistory", description="Löscht den gespeicherten Verlauf eines Users.")
 @app_commands.describe(user="Optional ein bestimmter User")
 async def clearhistory(interaction: discord.Interaction, user: discord.Member | None = None):
     if interaction.guild is None:
