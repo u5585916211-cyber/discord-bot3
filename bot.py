@@ -170,7 +170,8 @@ def build_log_embed(
         description="Neue AI-Anfrage verarbeitet.",
         color=color,
     )
-    embed.add_field(name="👤 User", value=f"{user.mention}\n`{user.id}`", inline=True)
+    embed.add_field(name="👤 User", value=f"{user.mention}
+`{user.id}`", inline=True)
     embed.add_field(name="🎭 Mode", value=f"`{mode}`", inline=True)
     embed.add_field(name="📍 Source", value=f"`{source}`", inline=True)
     embed.add_field(name="🏠 Server", value=guild.name, inline=False)
@@ -309,12 +310,24 @@ async def on_message(message: discord.Message):
             log_embed.add_field(name="Mode", value=conf.get("mode", "normal"), inline=True)
             await log_channel.send(embed=log_embed)
     else:
-        if conf.get("show_reminder_message", True) and not message.content.startswith("/"):
+        if (
+            conf.get("show_reminder_message", True)
+            and message.channel.id == AI_CHAT_CHANNEL_ID
+            and not message.content.startswith("/")
+        ):
             now = asyncio.get_event_loop().time()
             key = f"reminder:{message.guild.id}:{message.channel.id}"
             if now - reminder_cooldowns[key] > 120:
                 reminder_cooldowns[key] = now
-                await message.channel.send("💡 Use `/ask` to talk to the AI.")
+                reminder = discord.Embed(
+                    title="💡 AI Chat Hinweis",
+                    description="Nutze **`/ask`**, wenn du privat und cleaner mit der AI schreiben willst.",
+                    color=conf.get("accent_color", 0x5865F2),
+                )
+                if message.guild.icon:
+                    reminder.set_thumbnail(url=message.guild.icon.url)
+                reminder.set_footer(text="Private Antwort mit /ask")
+                await message.channel.send(embed=reminder)
 
     await bot.process_commands(message)
 
